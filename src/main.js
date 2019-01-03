@@ -23,9 +23,11 @@ import {parse as parseArgv} from 'yargs';
 
 import {protocols} from '../electron-builder.json';
 
-import squirrelStartup from './main/squirrelStartup';
 import AutoLauncher from './main/AutoLauncher';
 import CriticalErrorHandler from './main/CriticalErrorHandler';
+import upgradeAutoLaunch from './main/autoLaunch';
+import autoUpdater from './main/autoUpdater';
+import buildConfig from './common/config/buildConfig';
 
 const criticalErrorHandler = new CriticalErrorHandler();
 
@@ -34,11 +36,7 @@ process.on('uncaughtException', criticalErrorHandler.processUncaughtExceptionHan
 global.willAppQuit = false;
 
 app.setAppUserModelId('com.squirrel.mattermost.Mattermost'); // Use explicit AppUserModelID
-if (squirrelStartup(() => {
-  app.quit();
-})) {
-  global.willAppQuit = true;
-}
+
 import settings from './common/settings';
 import CertificateStore from './main/certificateStore';
 const certificateStore = CertificateStore.load(path.resolve(app.getPath('userData'), 'certificate.json'));
@@ -176,14 +174,19 @@ const trayImages = (() => {
   }
 })();
 
-// If there is already an instance, activate the window in the existing instace and quit this one
-if (app.makeSingleInstance((commandLine/*, workingDirectory*/) => {
+// If there is already an instance, activate the window in the existing instance and quit this one
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.exit();
+  global.willAppQuit = true;
+}
+app.on('second-instance', (event, secondArgv) => {
   // Protocol handler for win32
   // argv: An array of the second instance’s (command line / deep linked) arguments
   if (process.platform === 'win32') {
     // Keep only command line / deep linked arguments
-    if (Array.isArray(commandLine.slice(1)) && commandLine.slice(1).length > 0) {
-      setDeeplinkingUrl(commandLine.slice(1)[0]);
+    if (Array.isArray(secondArgv.slice(1)) && secondArgv.slice(1).length > 0) {
+      setDeeplinkingUrl(secondArgv.slice(1)[0]);
       mainWindow.webContents.send('protocol-deeplink', deeplinkingUrl);
     }
   }
@@ -196,9 +199,7 @@ if (app.makeSingleInstance((commandLine/*, workingDirectory*/) => {
       mainWindow.show();
     }
   }
-})) {
-  app.exit();
-}
+});
 
 function shouldShowTrayIcon() {
   if (process.platform === 'win32') {
@@ -330,7 +331,7 @@ app.on('certificate-error', (event, webContents, url, error, certificate, callba
 });
 
 app.on('gpu-process-crashed', (event, killed) => {
-  console.log(`The GPU process has crached (killed = ${killed})`);
+  console.log(`The GPU process has crashed (killed = ${killed})`);
 });
 
 const loginCallbackMap = new Map();
@@ -416,6 +417,10 @@ app.on('ready', () => {
   }
   appState.lastAppVersion = app.getVersion();
 
+  if (!global.isDev) {
+    upgradeAutoLaunch();
+  }
+
   if (global.isDev) {
     installExtension(REACT_DEVELOPER_TOOLS).
       then((name) => console.log(`Added Extension:  ${name}`)).
@@ -452,6 +457,9 @@ app.on('ready', () => {
   mainWindow.on('unresponsive', criticalErrorHandler.windowUnresponsiveHandler.bind(criticalErrorHandler));
   mainWindow.webContents.on('crashed', () => {
     throw new Error('webContents \'crashed\' event has been emitted');
+  });
+  mainWindow.on('ready-to-show', () => {
+    autoUpdater.checkForUpdates();
   });
 
   ipcMain.on('notified', () => {
@@ -646,6 +654,21 @@ app.on('ready', () => {
   const trustedURLs = settings.mergeDefaultTeams(config.teams).map((team) => team.url);
   permissionManager = new PermissionManager(permissionFile, trustedURLs);
   session.defaultSession.setPermissionRequestHandler(permissionRequestHandler(mainWindow, permissionManager));
+
+  if (buildConfig.enableAutoUpdater) {
+    const updaterConfig = autoUpdater.loadConfig();
+    autoUpdater.initialize(appState, mainWindow, updaterConfig.isNotifyOnly());
+    ipcMain.on('check-for-updates', autoUpdater.checkForUpdates);
+    mainWindow.once('show', () => {
+      if (autoUpdater.shouldCheckForUpdatesOnStart(appState.updateCheckedDate)) {
+        ipcMain.emit('check-for-updates');
+      } else {
+        setTimeout(() => {
+          ipcMain.emit('check-for-updates');
+        }, autoUpdater.UPDATER_INTERVAL_IN_MS);
+      }
+    });
+  }
 
   // Open the DevTools.
   // mainWindow.openDevTools();
